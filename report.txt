@@ -1,0 +1,7 @@
+word	count	font_size
+apple	10	Huge
+banana	7	Big
+cherry	6	Normal
+date	4	Normal
+fig	3	Small
+grape	2	Small
