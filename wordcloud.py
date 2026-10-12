@@ -2,16 +2,83 @@
 
 import argparse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import os
 from pathlib import Path
-import re
+import tempfile
+import unicodedata
+
+
+def words_in_line(line: str):
+    """Yield NFC words made of letters, attached marks and internal apostrophes."""
+    line = unicodedata.normalize("NFC", line)
+    token = []
+    for index, character in enumerate(line):
+        category = unicodedata.category(character)
+        if category.startswith("L") or (token and category.startswith("M")):
+            token.append(character)
+        elif (character in "'’" and token and index + 1 < len(line)
+              and unicodedata.category(line[index + 1]).startswith("L")):
+            token.append("'")
+        else:
+            if token:
+                yield unicodedata.normalize("NFC", "".join(token).casefold())
+                token = []
+    if token:
+        yield unicodedata.normalize("NFC", "".join(token).casefold())
 
 
 def count_file(path: Path) -> Counter:
-    """Read one UTF-8 file and count case-insensitive Unicode words."""
-    text = path.read_text(encoding="utf-8-sig")
-    words = re.findall(r"[^\W\d_]+(?:['’][^\W\d_]+)*", text)
-    return Counter(word.casefold().replace("’", "'") for word in words)
+    """Count one UTF-8 file by line without building a whole-file token list."""
+    counts = Counter()
+    try:
+        with path.open(encoding="utf-8-sig") as source:
+            for line in source:
+                counts.update(words_in_line(line))
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"Cannot read input file {path}: {error}") from error
+    return counts
+
+
+def combine_files(files, workers: int = 32) -> Counter:
+    """Keep at most one outstanding file task per worker, merging as they finish."""
+    counts = Counter()
+    paths = iter(files)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = {executor.submit(count_file, path)
+                   for path in [next(paths, None) for _ in range(workers)]
+                   if path is not None}
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                counts.update(future.result())
+            completed.clear()  # Release per-file results before submitting more.
+            for _ in range(workers - len(pending)):
+                path = next(paths, None)
+                if path is None:
+                    break
+                pending.add(executor.submit(count_file, path))
+    return counts
+
+
+def write_report(output: Path, rows, maximum: int) -> None:
+    """Publish a complete report by replacing the destination atomically."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=output.parent,
+            prefix=".wordcloud-", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write("word\tcount\tfont_size\n")
+            for word, count in rows:
+                stream.write(f"{word}\t{count}\t{font_size(count, maximum)}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def font_size(count: int, maximum: int) -> str:
@@ -37,22 +104,15 @@ def build_report(folder: Path, output: Path) -> int:
     if not files:
         raise ValueError(f"No text files found in: {folder}")
 
-    counts = Counter()
     # Each submitted task reads exactly one file. Only the main thread merges.
-    with ThreadPoolExecutor(max_workers=min(32, len(files))) as executor:
-        for file_counts in executor.map(count_file, files):
-            counts.update(file_counts)
+    counts = combine_files(files, workers=min(32, len(files)))
 
     maximum = max(counts.values(), default=0)
     rows = sorted(
         ((word, count) for word, count in counts.items() if count > 1),
         key=lambda item: (-item[1], item[0]),
     )
-    lines = ["word\tcount\tfont_size"]
-    lines.extend(
-        f"{word}\t{count}\t{font_size(count, maximum)}" for word, count in rows
-    )
-    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_report(output, rows, maximum)
     return len(files)
 
 
@@ -64,7 +124,8 @@ def main() -> None:
     try:
         file_count = build_report(args.folder, args.output)
     except (OSError, UnicodeError, ValueError) as error:
-        parser.exit(1, f"Error: {error}\n")
+        parser.exit(1, f"Error: {error}\nNo new report was published. "
+                    "Any previous report remains unchanged and may be stale.\n")
     print(f"Read {file_count} files. Report saved to {args.output}")
 
 
